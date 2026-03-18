@@ -27,6 +27,13 @@ class PipelineConfig:
     input_path: Path = Path("input.jsonl")
     output_path: Path = Path("output.jsonl")
     report_path: Path = Path("report.json")
-    mode: str = "generate"  # "generate" | "evaluate"
+    mode: str = "generate"  # "generate" | "evaluate" | "cot"
     pass_threshold: float = 7.0  # 评分 >= 此值视为通过 (满分 10)
     max_rework_rounds: int = 2  # 打回重写最大轮次
+    enable_dedup: bool = False          # 启用去重
+    dedup_threshold: float = 0.85       # 去重相似度阈值
+    enable_difficulty: bool = False     # 启用难度分级
+    enable_augment: bool = False        # 启用数据增强
+    augment_variants: int = 3           # 每题生成变体数
+    enable_self_consistency: bool = False  # 启用多路采样验证
+    consistency_samples: int = 5        # 多路采样数量

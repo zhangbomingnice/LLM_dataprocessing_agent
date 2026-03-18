@@ -22,6 +22,10 @@ from agents.evaluator import EvaluatorAgent
 from agents.aggregator import AggregatorAgent
 from agents.cot_processor import CoTProcessorAgent, format_cot_answer
 from agents.cot_evaluator import CoTEvaluatorAgent
+from utils.dedup import Deduplicator
+from utils.difficulty import DifficultyClassifier
+from utils.augmentor import DataAugmentor
+from utils.self_consistency import SelfConsistencyChecker
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -41,6 +45,9 @@ class Pipeline:
         console.print("\n[bold]▶ Stage 0:[/bold] 加载语料文件...")
         items = await self._load_input(user_instruction)
         console.print(f"  已加载 [green]{len(items)}[/green] 条数据 ← {self.config.input_path}")
+
+        # ── Stage 0.5: 数据预处理（去重 / 难度分级 / 增强）────
+        items = await self._preprocess(items)
 
         # ── Stage 1: Planner ───────────────────────────────────
         console.print("\n[bold]▶ Stage 1:[/bold] Planner 分析任务需求...")
@@ -207,6 +214,38 @@ class Pipeline:
                 cot_steps=steps if steps else None,
             ))
 
+        # ── Stage 2.5: Self-Consistency 多路验证（可选）────────
+        if cfg.enable_self_consistency:
+            console.print(f"\n[bold]  ◆ Self-Consistency 多路采样验证（{cfg.consistency_samples} 路）...[/bold]")
+            sc = SelfConsistencyChecker(cfg.llm, n_samples=cfg.consistency_samples)
+
+            with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                          BarColumn(), TaskProgressColumn(), console=console) as progress:
+                sc_task = progress.add_task("  一致性检查", total=len(output_items))
+                sc_semaphore = asyncio.Semaphore(cfg.llm.concurrency)
+
+                async def _sc_check(o: OutputItem) -> None:
+                    async with sc_semaphore:
+                        result = await sc.check(o.question)
+                        o.cot_steps = o.cot_steps  # keep steps
+                        if not o.cot_steps:
+                            o.cot_steps = []
+                        # 将一致性结果存入 metadata 字段（复用 answer 的 OutputItem）
+                        # 通过在 answer 末尾标注一致性信息
+                        confidence = result["confidence"]
+                        is_consistent = result["is_consistent"]
+                        if hasattr(o, '_sc_result'):
+                            pass
+                        o._sc_result = result  # type: ignore[attr-defined]
+                        progress.advance(sc_task)
+
+                await asyncio.gather(*[_sc_check(o) for o in output_items], return_exceptions=True)
+
+            consistent_count = sum(1 for o in output_items if getattr(o, '_sc_result', {}).get('is_consistent', False))
+            console.print(
+                f"    [green]{consistent_count}/{len(output_items)}[/green] 条答案多路一致"
+            )
+
         # ── Stage 3: CoT Evaluator 逐步骤验证 + 打回重写 ──────
         console.print("\n[bold]▶ Stage 3:[/bold] CoT-Evaluator 逐步骤验证...")
         cot_evaluator = CoTEvaluatorAgent(cfg.llm, plan=plan, pass_threshold=cfg.pass_threshold)
@@ -308,6 +347,51 @@ class Pipeline:
         table.add_row("最终答案正确率", stats.get("final_answer_accuracy", "N/A"))
         table.add_row("重写条目数", str(stats.get("items_reworked", 0)))
         console.print(table)
+
+    # ── 数据预处理 ─────────────────────────────────────────────
+    async def _preprocess(self, items: list[CorpusItem]) -> list[CorpusItem]:
+        """执行可选的预处理步骤：去重、难度分级、数据增强。"""
+        cfg = self.config
+
+        # 去重
+        if cfg.enable_dedup:
+            console.print("\n[bold]  ◆ 去重处理...[/bold]")
+            dedup = Deduplicator(similarity_threshold=cfg.dedup_threshold)
+            items, removed = dedup.run(items)
+            console.print(
+                f"    保留 [green]{len(items)}[/green] 条，"
+                f"去除 [red]{len(removed)}[/red] 条重复"
+            )
+
+        # 难度分级
+        if cfg.enable_difficulty:
+            console.print("\n[bold]  ◆ 难度分级...[/bold]")
+            classifier = DifficultyClassifier()
+            diff_results = classifier.classify_batch(items)
+            stats = {"easy": 0, "medium": 0, "hard": 0}
+            for item, dr in zip(items, diff_results):
+                item.metadata["difficulty"] = dr["level"]
+                item.metadata["difficulty_score"] = dr["score"]
+                stats[dr["level"]] += 1
+            console.print(
+                f"    [green]easy: {stats['easy']}[/green] / "
+                f"[yellow]medium: {stats['medium']}[/yellow] / "
+                f"[red]hard: {stats['hard']}[/red]"
+            )
+
+        # 数据增强
+        if cfg.enable_augment:
+            console.print(f"\n[bold]  ◆ 数据增强（每题 {cfg.augment_variants} 个变体）...[/bold]")
+            augmentor = DataAugmentor(cfg.llm, n_variants=cfg.augment_variants)
+            variants = await augmentor.run_batch(items, concurrency=cfg.llm.concurrency)
+            console.print(
+                f"    原始 [cyan]{len(items)}[/cyan] 条 → "
+                f"新增 [green]{len(variants)}[/green] 条变体"
+            )
+            items.extend(variants)
+            console.print(f"    总计 [bold]{len(items)}[/bold] 条")
+
+        return items
 
     # ── 辅助方法 ───────────────────────────────────────────────
     async def _load_input(self, user_instruction: str) -> list[CorpusItem]:
