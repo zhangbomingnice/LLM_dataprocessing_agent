@@ -11,7 +11,7 @@ from rich.panel import Panel
 
 from config import PipelineConfig
 from utils.schema import (
-    CorpusItem, OutputItem, PlannerOutput, EvalResult, TaskType,
+    CorpusItem, OutputItem, PlannerOutput, EvalResult, CoTEvalResult, CoTStep, TaskType,
 )
 from utils.io import read_jsonl, write_jsonl
 from utils.file_parser import load_file, build_extraction_prompt, parse_extracted_json
@@ -20,6 +20,8 @@ from agents.planner import PlannerAgent
 from agents.processor import ProcessorAgent
 from agents.evaluator import EvaluatorAgent
 from agents.aggregator import AggregatorAgent
+from agents.cot_processor import CoTProcessorAgent, format_cot_answer
+from agents.cot_evaluator import CoTEvaluatorAgent
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -47,7 +49,9 @@ class Pipeline:
         self._display_plan(plan)
 
         # ── 根据模式分流 ───────────────────────────────────────
-        if plan.task_type == TaskType.GENERATE:
+        if self.config.mode == "cot" or plan.task_type == TaskType.COT:
+            return await self._run_cot_pipeline(items, plan)
+        elif plan.task_type == TaskType.GENERATE:
             return await self._run_generate_pipeline(items, plan)
         else:
             return await self._run_evaluate_pipeline(items, plan)
@@ -151,6 +155,159 @@ class Pipeline:
 
         self._display_report(report)
         return report
+
+    # ── CoT 模式流水线 ───────────────────────────────────────────
+    async def _run_cot_pipeline(
+        self,
+        items: list[CorpusItem],
+        plan: PlannerOutput,
+    ) -> dict:
+        cfg = self.config
+
+        # ── Stage 2: CoT Processor 生成推理链 ──────────────────
+        console.print("\n[bold]▶ Stage 2:[/bold] CoT-Processor 生成分步推理链...")
+        cot_processor = CoTProcessorAgent(cfg.llm, plan=plan)
+
+        semaphore = asyncio.Semaphore(cfg.llm.concurrency)
+        cot_results: dict[str | int, dict] = {}
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("  CoT 生成中", total=len(items))
+
+            async def _process(item: CorpusItem) -> None:
+                async with semaphore:
+                    try:
+                        result = await cot_processor.run(item)
+                        cot_results[item.id] = result
+                    except Exception as e:
+                        logger.error("条目 %s CoT 生成失败: %s", item.id, e)
+                    progress.advance(task)
+
+            await asyncio.gather(*[_process(item) for item in items], return_exceptions=True)
+
+        console.print(f"  完成: [green]{len(cot_results)}/{len(items)}[/green]")
+
+        output_items = []
+        for item in items:
+            cot = cot_results.get(item.id, {})
+            steps = cot.get("steps", [])
+            thinking = cot.get("thinking", "")
+            final_answer = cot.get("final_answer", "")
+            answer = format_cot_answer(thinking, steps, final_answer)
+            output_items.append(OutputItem(
+                id=item.id,
+                question=item.question,
+                answer=answer,
+                cot_steps=steps if steps else None,
+            ))
+
+        # ── Stage 3: CoT Evaluator 逐步骤验证 + 打回重写 ──────
+        console.print("\n[bold]▶ Stage 3:[/bold] CoT-Evaluator 逐步骤验证...")
+        cot_evaluator = CoTEvaluatorAgent(cfg.llm, plan=plan, pass_threshold=cfg.pass_threshold)
+
+        for round_idx in range(1, cfg.max_rework_rounds + 1):
+            eval_batch = []
+            for o in output_items:
+                if o.cot_steps:
+                    ref_answer = next((it.answer for it in items if it.id == o.id), "")
+                    final_ans = o.answer.split("**最终答案：**")[-1].strip() if "**最终答案：**" in o.answer else ""
+                    eval_batch.append((str(o.id), o.question, o.cot_steps, final_ans, ref_answer))
+
+            eval_results = await cot_evaluator.run_batch(eval_batch, concurrency=cfg.llm.concurrency)
+
+            eval_map: dict[str, CoTEvalResult] = {str(r.item_id): r for r in eval_results}
+            for o in output_items:
+                if str(o.id) in eval_map:
+                    o.cot_evaluation = eval_map[str(o.id)]
+
+            failed = [o for o in output_items if o.cot_evaluation and not o.cot_evaluation.passed]
+            passed_count = len(output_items) - len(failed)
+
+            console.print(
+                f"  第 {round_idx} 轮验证: "
+                f"[green]{passed_count} 通过[/green] / "
+                f"[red]{len(failed)} 未通过[/red]"
+            )
+
+            if failed:
+                error_steps = sum(
+                    r.total_steps - r.correct_steps
+                    for r in eval_results if not r.passed
+                )
+                console.print(f"  共发现 [red]{error_steps}[/red] 个错误步骤")
+
+            if not failed or round_idx == cfg.max_rework_rounds:
+                break
+
+            console.print(f"  打回 {len(failed)} 条进行重写...")
+            for o in failed:
+                if o.cot_evaluation and o.cot_steps:
+                    feedback = cot_evaluator.format_feedback(o.cot_evaluation)
+                    rework_item = CorpusItem(id=o.id, question=o.question, answer=o.answer)
+                    new_cot = await cot_processor.rework(rework_item, feedback, o.cot_steps)
+                    new_steps = new_cot.get("steps", [])
+                    o.cot_steps = new_steps if new_steps else o.cot_steps
+                    o.answer = format_cot_answer(
+                        new_cot.get("thinking", ""),
+                        new_steps,
+                        new_cot.get("final_answer", ""),
+                    )
+                    o.rework_count += 1
+
+        # ── Stage 4: Aggregator 整合输出 ───────────────────────
+        console.print("\n[bold]▶ Stage 4:[/bold] Aggregator 整合输出...")
+        aggregator = AggregatorAgent(cfg.llm)
+        report = await aggregator.run(output_items, cfg.output_path, cfg.report_path)
+
+        cot_stats = self._build_cot_stats(output_items)
+        report["cot_stats"] = cot_stats
+
+        self._display_report(report)
+        self._display_cot_stats(cot_stats)
+        return report
+
+    @staticmethod
+    def _build_cot_stats(items: list[OutputItem]) -> dict:
+        """汇总 CoT 统计信息。"""
+        evaluated = [i for i in items if i.cot_evaluation]
+        if not evaluated:
+            return {}
+
+        total_steps = sum(e.cot_evaluation.total_steps for e in evaluated if e.cot_evaluation)
+        correct_steps = sum(e.cot_evaluation.correct_steps for e in evaluated if e.cot_evaluation)
+        coherence_scores = [e.cot_evaluation.chain_coherence for e in evaluated if e.cot_evaluation]
+        final_correct = sum(1 for e in evaluated if e.cot_evaluation and e.cot_evaluation.final_answer_correct)
+
+        return {
+            "total_items": len(evaluated),
+            "total_steps": total_steps,
+            "correct_steps": correct_steps,
+            "step_accuracy": f"{correct_steps / total_steps * 100:.1f}%" if total_steps else "N/A",
+            "avg_coherence": round(sum(coherence_scores) / len(coherence_scores), 2) if coherence_scores else 0,
+            "final_answer_accuracy": f"{final_correct / len(evaluated) * 100:.1f}%",
+            "items_reworked": sum(1 for i in items if i.rework_count > 0),
+        }
+
+    @staticmethod
+    def _display_cot_stats(stats: dict) -> None:
+        if not stats:
+            return
+        console.print()
+        table = Table(title="CoT 推理链统计", show_header=False, padding=(0, 2))
+        table.add_column("指标", style="bold magenta")
+        table.add_column("值")
+        table.add_row("总步骤数", str(stats.get("total_steps", 0)))
+        table.add_row("正确步骤", f"{stats.get('correct_steps', 0)} ({stats.get('step_accuracy', 'N/A')})")
+        table.add_row("推理链连贯性", f"{stats.get('avg_coherence', 0):.1f} / 10")
+        table.add_row("最终答案正确率", stats.get("final_answer_accuracy", "N/A"))
+        table.add_row("重写条目数", str(stats.get("items_reworked", 0)))
+        console.print(table)
 
     # ── 辅助方法 ───────────────────────────────────────────────
     async def _load_input(self, user_instruction: str) -> list[CorpusItem]:

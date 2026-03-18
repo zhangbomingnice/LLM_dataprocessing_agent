@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 class TaskType(str, Enum):
     GENERATE = "generate"
     EVALUATE = "evaluate"
+    COT = "cot"
 
 
 class Domain(str, Enum):
@@ -59,10 +60,42 @@ class EvalResult(BaseModel):
     suggestion: str = ""
 
 
+# ── CoT 步骤结构 ──────────────────────────────────────────────
+class CoTStep(BaseModel):
+    step_number: int
+    step_type: str = ""  # 如: 审题, 建模, 公式推导, 代入计算, 验证, 结论
+    content: str
+    formula: str = ""    # 该步骤涉及的核心公式（LaTeX）
+
+
+class StepVerification(BaseModel):
+    step_number: int
+    is_correct: bool
+    error_type: str = ""    # 如: 无误, 计算错误, 逻辑跳跃, 公式误用, 概念混淆
+    explanation: str = ""
+    suggested_fix: str = ""
+
+
+class CoTEvalResult(BaseModel):
+    item_id: str | int
+    total_steps: int = 0
+    correct_steps: int = 0
+    first_error_step: int | None = None
+    step_accuracy: float = 0.0
+    overall_score: float = Field(ge=0, le=10, default=0)
+    passed: bool = False
+    step_verifications: list[StepVerification] = Field(default_factory=list)
+    chain_coherence: float = Field(ge=0, le=10, default=0)  # 推理链连贯性
+    final_answer_correct: bool = False
+    suggestion: str = ""
+
+
 # ── 最终输出条目 ──────────────────────────────────────────────
 class OutputItem(BaseModel):
     id: str | int
     question: str
     answer: str
+    cot_steps: list[CoTStep] | None = None
     evaluation: EvalResult | None = None
+    cot_evaluation: CoTEvalResult | None = None
     rework_count: int = 0

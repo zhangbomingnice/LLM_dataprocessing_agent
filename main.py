@@ -31,8 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "mode",
-        choices=["generate", "evaluate"],
-        help="运行模式: generate(生成/重写) 或 evaluate(评估打分)",
+        choices=["generate", "evaluate", "cot"],
+        help="运行模式: generate(生成/重写), evaluate(评估打分), cot(思维链标注)",
     )
     parser.add_argument(
         "instruction",
