@@ -1,0 +1,5 @@
+{"id": "math_001", "question": "求解方程 2x + 5 = 13", "answer": "x=4"}
+{"id": "math_002", "question": "一个圆的半径为 5cm，求其面积。", "answer": "面积是78.5平方厘米"}
+{"id": "math_003", "question": "计算 $\\int_0^1 x^2 dx$ 的值。", "answer": "1/3"}
+{"id": "math_004", "question": "某商品原价 200 元，先涨价 10%，再降价 10%，最终价格是多少？", "answer": "198元"}
+{"id": "math_005", "question": "证明：对于任意正整数 n，$1+2+3+...+n = \\frac{n(n+1)}{2}$。", "answer": "用数学归纳法可以证明。"}
