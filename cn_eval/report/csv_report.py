@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from cn_eval.data_loader.schema import PairwiseResult, LongAnswerResult, IFResult
+from cn_eval.data_loader.schema import PairwiseResult, EvalResult, DIMENSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -25,45 +25,40 @@ class CSVReporter:
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        a_dims = [f"a_{d}" for d in DIMENSIONS]
+        b_dims = [f"b_{d}" for d in DIMENSIONS]
         fieldnames = [
             "prompt_id", "model_a", "model_b", "winner",
-            "a_mode", "a_structure", "a_organization", "a_fluency", "a_non_repetition", "a_task_fit", "a_mean",
-            "b_mode", "b_structure", "b_organization", "b_fluency", "b_non_repetition", "b_task_fit", "b_mean",
-            "judge_id", "reasoning",
+            *a_dims, "a_mean",
+            *b_dims, "b_mean",
+            "winner_agreement", "judge_id", "reasoning",
         ]
 
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in results:
-                writer.writerow({
+                row: dict[str, Any] = {
                     "prompt_id": r.prompt_id,
                     "model_a": r.model_a,
                     "model_b": r.model_b,
                     "winner": r.winner,
-                    "a_mode": r.scores_a.mode,
-                    "a_structure": r.scores_a.structure,
-                    "a_organization": r.scores_a.organization,
-                    "a_fluency": r.scores_a.fluency,
-                    "a_non_repetition": r.scores_a.non_repetition,
-                    "a_task_fit": r.scores_a.task_fit,
                     "a_mean": round(r.scores_a.mean(), 3),
-                    "b_mode": r.scores_b.mode,
-                    "b_structure": r.scores_b.structure,
-                    "b_organization": r.scores_b.organization,
-                    "b_fluency": r.scores_b.fluency,
-                    "b_non_repetition": r.scores_b.non_repetition,
-                    "b_task_fit": r.scores_b.task_fit,
                     "b_mean": round(r.scores_b.mean(), 3),
+                    "winner_agreement": r.consistency.get("winner_agreement", ""),
                     "judge_id": r.judge_id,
                     "reasoning": r.reasoning[:200],
-                })
+                }
+                for d in DIMENSIONS:
+                    row[f"a_{d}"] = getattr(r.scores_a, d)
+                    row[f"b_{d}"] = getattr(r.scores_b, d)
+                writer.writerow(row)
 
-        logger.info("[CSVReport] Pairwise CSV: %s (%d 条)", path, len(results))
+        logger.info("[CSVReport] Pairwise: %s (%d 条)", path, len(results))
 
-    def export_long_answer(
+    def export_single(
         self,
-        results: list[LongAnswerResult],
+        results: list[EvalResult],
         output_path: str | Path,
     ) -> None:
         path = Path(output_path)
@@ -71,7 +66,8 @@ class CSVReporter:
 
         fieldnames = [
             "prompt_id", "model_version",
-            "mode", "structure", "organization", "fluency", "non_repetition", "task_fit", "mean",
+            *DIMENSIONS, "mean",
+            "uncertain", "max_std",
             "repetition_worst", "template_count", "assistant_count",
             "paragraph_count", "sentence_count",
         ]
@@ -80,61 +76,30 @@ class CSVReporter:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for r in results:
-                ngram = r.repetition_stats.get("ngram_rates", {})
+                pre = r.pre_analysis
+                ngram = pre.get("repetition", {}).get("ngram_rates", {})
                 worst_rep = max(ngram.values()) if ngram else 0
-                writer.writerow({
+                row: dict[str, Any] = {
                     "prompt_id": r.prompt_id,
                     "model_version": r.model_version,
-                    "mode": r.scores.mode,
-                    "structure": r.scores.structure,
-                    "organization": r.scores.organization,
-                    "fluency": r.scores.fluency,
-                    "non_repetition": r.scores.non_repetition,
-                    "task_fit": r.scores.task_fit,
                     "mean": round(r.scores.mean(), 3),
+                    "uncertain": r.consistency.get("uncertain", False),
+                    "max_std": r.consistency.get("max_std", 0),
                     "repetition_worst": round(worst_rep, 4),
-                    "template_count": r.style_stats.get("template_ending_count", 0),
-                    "assistant_count": r.style_stats.get("assistant_phrase_count", 0),
-                    "paragraph_count": r.structure_stats.get("paragraph_count", 0),
-                    "sentence_count": r.structure_stats.get("sentence_count", 0),
-                })
-
-        logger.info("[CSVReport] Long-Answer CSV: %s (%d 条)", path, len(results))
-
-    def export_if_eval(
-        self,
-        results: list[IFResult],
-        output_path: str | Path,
-    ) -> None:
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        all_checks = set()
-        for r in results:
-            all_checks.update(r.checks.keys())
-        sorted_checks = sorted(all_checks)
-
-        fieldnames = ["prompt_id", "model_version", "passed"] + sorted_checks + ["details"]
-
-        with open(path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for r in results:
-                row = {
-                    "prompt_id": r.prompt_id,
-                    "model_version": r.model_version,
-                    "passed": r.passed,
-                    "details": r.details[:200],
+                    "template_count": pre.get("style", {}).get("template_ending_count", 0),
+                    "assistant_count": pre.get("style", {}).get("assistant_phrase_count", 0),
+                    "paragraph_count": pre.get("structure", {}).get("paragraph_count", 0),
+                    "sentence_count": pre.get("structure", {}).get("sentence_count", 0),
                 }
-                for check in sorted_checks:
-                    row[check] = r.checks.get(check, "")
+                for d in DIMENSIONS:
+                    row[d] = getattr(r.scores, d)
                 writer.writerow(row)
 
-        logger.info("[CSVReport] IF-Eval CSV: %s (%d 条)", path, len(results))
+        logger.info("[CSVReport] Single: %s (%d 条)", path, len(results))
 
     def export_anomalies(
         self,
-        anomalies: list[dict],
+        anomalies: list,
         output_path: str | Path,
     ) -> None:
         path = Path(output_path)
@@ -146,16 +111,14 @@ class CSVReporter:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for a in anomalies:
-                types = a.get("anomaly_types", [])
-                if hasattr(a, "anomaly_types"):
-                    types = a.anomaly_types
+                types = getattr(a, "anomaly_types", a.get("anomaly_types", []))
                 writer.writerow({
                     "prompt_id": getattr(a, "prompt_id", a.get("prompt_id", "")),
                     "anomaly_types": "; ".join(types if isinstance(types, list) else [str(types)]),
                     "details": str(getattr(a, "details", a.get("details", "")))[:300],
                 })
 
-        logger.info("[CSVReport] Anomalies CSV: %s (%d 条)", path, len(anomalies))
+        logger.info("[CSVReport] Anomalies: %s (%d 条)", path, len(anomalies))
 
     def export_version_table(
         self,
@@ -173,4 +136,4 @@ class CSVReporter:
             writer.writeheader()
             writer.writerows(rows)
 
-        logger.info("[CSVReport] Version table CSV: %s (%d 条)", path, len(rows))
+        logger.info("[CSVReport] Version table: %s (%d 条)", path, len(rows))

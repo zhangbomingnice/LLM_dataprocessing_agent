@@ -1,7 +1,7 @@
 """
 图表生成器 — 使用 matplotlib 生成评测可视化图表。
 
-如果 matplotlib 不可用则优雅降级（跳过图表）。
+如果 matplotlib 不可用则优雅降级。
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Any
+
+from cn_eval.data_loader.schema import DIMENSIONS, DIM_LABELS_ZH
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +25,7 @@ except ImportError:
     logger.info("[ChartGen] matplotlib 不可用，图表功能已禁用")
 
 
-DIMENSIONS = ["mode", "structure", "organization", "fluency", "non_repetition", "task_fit"]
-DIM_LABELS_ZH = ["模态", "结构", "编排", "流畅", "非重复", "任务匹配"]
-
-
 def _setup_chinese_font():
-    """尝试设置中文字体。"""
     if not HAS_MPL:
         return
     chinese_fonts = ["SimHei", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC"]
@@ -58,7 +55,6 @@ class ChartGenerator:
         title: str = "维度对比雷达图",
         filename: str = "radar.png",
     ) -> str | None:
-        """生成多版本维度雷达图。"""
         if not HAS_MPL or not version_scores:
             return None
 
@@ -98,7 +94,6 @@ class ChartGenerator:
         title: str = "维度分数对比",
         filename: str = "bar_compare.png",
     ) -> str | None:
-        """生成维度分数柱状图。"""
         if not HAS_MPL or not version_scores:
             return None
 
@@ -146,7 +141,6 @@ class ChartGenerator:
         title: str = "胜率分布",
         filename: str = "winrate_pie.png",
     ) -> str | None:
-        """生成胜率饼图。"""
         if not HAS_MPL:
             return None
 
@@ -172,14 +166,13 @@ class ChartGenerator:
         title: str = "分数分布",
         filename: str = "score_dist.png",
     ) -> str | None:
-        """生成分数分布直方图。"""
         if not HAS_MPL or not scores:
             return None
 
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.hist(scores, bins=20, edgecolor="black", alpha=0.7, color="#4CAF50")
-        ax.axvline(sum(scores) / len(scores), color="red", linestyle="--",
-                    label=f"均值 = {sum(scores) / len(scores):.2f}")
+        mean = sum(scores) / len(scores)
+        ax.axvline(mean, color="red", linestyle="--", label=f"均值 = {mean:.2f}")
         ax.set_xlabel("分数")
         ax.set_ylabel("频次")
         ax.set_title(title, fontsize=14, fontweight="bold")

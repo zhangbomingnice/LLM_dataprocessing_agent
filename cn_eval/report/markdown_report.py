@@ -9,7 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from cn_eval.data_loader.schema import DIMENSIONS, DIM_LABELS_ZH
+
 logger = logging.getLogger(__name__)
+
+_DIM_ZH = dict(zip(DIMENSIONS, DIM_LABELS_ZH))
 
 
 class MarkdownReporter:
@@ -44,44 +48,37 @@ class MarkdownReporter:
 
             if mode == "pairwise":
                 lines.extend(self._render_pairwise(data))
-            elif mode == "long_answer":
-                lines.extend(self._render_long_answer(data))
-            elif mode == "if_eval":
-                lines.extend(self._render_if_eval(data))
-            elif mode == "benchmark":
-                lines.extend(self._render_benchmark(data))
+            elif mode == "single":
+                lines.extend(self._render_single(data))
             else:
                 lines.extend(self._render_generic(data))
 
             lines.append("")
 
         lines.append("---")
-        lines.append("*由 cn_eval 自动生成*")
+        lines.append("*由 cn_eval 统一 LLM Judge 自动生成*")
 
         content = "\n".join(lines)
 
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
-        logger.info("[Report] Markdown 报告已保存: %s", output_path)
+        logger.info("[Report] Markdown: %s", output_path)
 
         return content
 
     def _mode_title(self, mode: str) -> str:
         titles = {
             "pairwise": "配对对比评测 (Pairwise)",
-            "long_answer": "长回答专项评测 (Long-Answer)",
-            "if_eval": "指令遵循评测 (IF-Eval)",
-            "benchmark": "基准评测 (Benchmark)",
+            "single": "单模型评测 (Single)",
         }
         return titles.get(mode, mode)
 
     def _render_pairwise(self, data: dict) -> list[str]:
-        lines = []
+        lines: list[str] = []
         summary = data.get("summary", {})
 
         if not summary:
-            # 可能是多对比较，嵌套结构
             for pair_key, pair_data in data.items():
                 if isinstance(pair_data, dict) and "summary" in pair_data:
                     lines.append(f"### {pair_key}")
@@ -93,7 +90,7 @@ class MarkdownReporter:
         return lines
 
     def _render_pairwise_single(self, data: dict) -> list[str]:
-        lines = []
+        lines: list[str] = []
         summary = data.get("summary", {})
 
         lines.append("### 胜率统计")
@@ -106,7 +103,11 @@ class MarkdownReporter:
         lines.append(f"| 总计 | {summary.get('total', 0)} 条 |")
         lines.append("")
 
-        # 维度对比
+        consistency = summary.get("consistency", {})
+        if consistency:
+            lines.append(f"**一致性**: 平均胜者一致率 {consistency.get('avg_winner_agreement', 0):.1%}")
+            lines.append("")
+
         scores_a = summary.get("avg_scores_a", {})
         scores_b = summary.get("avg_scores_b", {})
         if scores_a and scores_b:
@@ -114,15 +115,15 @@ class MarkdownReporter:
             lines.append("")
             lines.append("| 维度 | Baseline | Candidate | 差值 |")
             lines.append("|------|----------|-----------|------|")
-            for dim in scores_a:
+            for dim in DIMENSIONS:
                 a = scores_a.get(dim, 0)
                 b = scores_b.get(dim, 0)
                 diff = b - a
                 arrow = "↑" if diff > 0.1 else ("↓" if diff < -0.1 else "≈")
-                lines.append(f"| {dim} | {a:.3f} | {b:.3f} | {diff:+.3f} {arrow} |")
+                zh = _DIM_ZH.get(dim, dim)
+                lines.append(f"| {zh} | {a:.3f} | {b:.3f} | {diff:+.3f} {arrow} |")
             lines.append("")
 
-        # 分类统计
         cat_stats = summary.get("by_category", {})
         if cat_stats:
             lines.append("### 分类统计")
@@ -138,8 +139,8 @@ class MarkdownReporter:
 
         return lines
 
-    def _render_long_answer(self, data: dict) -> list[str]:
-        lines = []
+    def _render_single(self, data: dict) -> list[str]:
+        lines: list[str] = []
 
         for version, vdata in data.items():
             if not isinstance(vdata, dict):
@@ -155,8 +156,17 @@ class MarkdownReporter:
             if dim_avgs:
                 lines.append("| 维度 | 平均分 |")
                 lines.append("|------|--------|")
-                for dim, val in dim_avgs.items():
-                    lines.append(f"| {dim} | {val:.3f} |")
+                for dim in DIMENSIONS:
+                    zh = _DIM_ZH.get(dim, dim)
+                    lines.append(f"| {zh} | {dim_avgs.get(dim, 0):.3f} |")
+                lines.append("")
+
+            consistency = summary.get("consistency", {})
+            if consistency:
+                lines.append(
+                    f"**一致性**: 不确定率 {consistency.get('uncertain_rate', 0):.1%}, "
+                    f"平均最大标准差 {consistency.get('avg_max_std', 0):.3f}"
+                )
                 lines.append("")
 
             qual_dist = summary.get("quality_distribution", {})
@@ -175,58 +185,8 @@ class MarkdownReporter:
 
         return lines
 
-    def _render_if_eval(self, data: dict) -> list[str]:
-        lines = []
-
-        for version, vdata in data.items():
-            if not isinstance(vdata, dict):
-                continue
-            summary = vdata.get("summary", {})
-            lines.append(f"### 模型: {version}")
-            lines.append("")
-            lines.append(f"- 总数: {summary.get('total', 0)}")
-            lines.append(f"- 通过: {summary.get('passed', 0)}")
-            lines.append(f"- 失败: {summary.get('failed', 0)}")
-            lines.append(f"- 通过率: **{summary.get('pass_rate', 0):.1%}**")
-            lines.append("")
-
-            check_stats = summary.get("check_stats", {})
-            if check_stats:
-                lines.append("| 检查项 | 总数 | 通过 | 通过率 |")
-                lines.append("|--------|------|------|--------|")
-                for check, stats in check_stats.items():
-                    t = stats["total"]
-                    p = stats["passed"]
-                    rate = p / t if t else 0
-                    lines.append(f"| {check} | {t} | {p} | {rate:.1%} |")
-                lines.append("")
-
-        return lines
-
-    def _render_benchmark(self, data: dict) -> list[str]:
-        lines = []
-
-        for version, vdata in data.items():
-            if not isinstance(vdata, dict):
-                continue
-            summary = vdata.get("summary", {})
-            lines.append(f"### 模型: {version}")
-            lines.append("")
-            lines.append("| 指标 | 值 |")
-            lines.append("|------|-----|")
-            for k, v in summary.items():
-                if k == "total":
-                    lines.append(f"| 总数 | {v} |")
-                elif isinstance(v, float):
-                    lines.append(f"| {k} | {v:.4f} |")
-                else:
-                    lines.append(f"| {k} | {v} |")
-            lines.append("")
-
-        return lines
-
     def _render_generic(self, data: dict) -> list[str]:
-        lines = []
+        lines: list[str] = []
         if isinstance(data, dict):
             for k, v in data.items():
                 lines.append(f"- **{k}**: {v}")

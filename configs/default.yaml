@@ -13,29 +13,30 @@ data:
   category_field: "category"
 
 eval:
-  modes: ["pairwise", "long_answer"]
+  modes: ["pairwise", "single"]
   baseline: "base"
   candidates: []
   dimensions:
-    - mode
+    - format
     - structure
-    - organization
-    - fluency
-    - non_repetition
-    - task_fit
+    - repetition
+    - info_quality
+    - naturalness
+    - task_completion
 
 judge:
   primary: "MiniMax-Text-01"
   api_base: "https://api.minimax.chat/v1"
-  secondary: []
-  secondary_sample_ratio: 0.2
   temperature: 0.0
-  blind_ab: true
-  swap_ratio: 0.5
-  prompt_template: "configs/judge_prompts/pairwise_zh.txt"
-  aggregation: "majority_vote"
+  prompt_template: "configs/judge_prompts/unified_zh.txt"
   concurrency: 5
   max_tokens: 4096
+
+consistency:
+  num_rounds: 3
+  temperatures: [0.0, 0.05, 0.1]
+  variance_threshold: 1.5
+  aggregation: "median"
 
 stats:
   trimmed_ratio: 0.1
@@ -57,7 +58,6 @@ long_answer:
     - "希望以上内容对你有所帮助"
     - "以上就是"
   half_split_ratio: 0.5
-  similarity_model: "shibing624/text2vec-base-chinese"
 
 report:
   formats: ["markdown", "csv"]

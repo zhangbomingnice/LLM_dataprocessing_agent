@@ -21,7 +21,7 @@ console = Console()
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cn-eval",
-        description="中文长回答 SFT 评测系统",
+        description="中文长回答 SFT 评测系统（统一 LLM Judge）",
     )
     parser.add_argument(
         "--config", "-c",
@@ -32,73 +32,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preset",
         type=str,
-        choices=["pairwise", "long_answer", "full_suite"],
-        help="使用预设配置 (覆盖 --config)",
+        choices=["pairwise", "single", "full"],
+        help="使用预设配置",
     )
+    parser.add_argument("--test-set", type=str, help="测试题集路径")
     parser.add_argument(
-        "--test-set",
-        type=str,
-        help="测试题集路径 (覆盖配置文件)",
-    )
-    parser.add_argument(
-        "--baseline",
-        type=str,
+        "--baseline", type=str,
         help="baseline 模型输出路径 (格式: version:path)",
     )
     parser.add_argument(
-        "--candidate",
-        type=str,
-        action="append",
-        help="candidate 模型输出路径 (格式: version:path，可多次使用)",
+        "--candidate", type=str, action="append",
+        help="candidate 模型输出路径 (格式: version:path，可多次)",
     )
     parser.add_argument(
-        "--modes",
-        type=str,
-        nargs="+",
-        choices=["pairwise", "long_answer", "if_eval", "benchmark"],
+        "--modes", type=str, nargs="+",
+        choices=["pairwise", "single"],
         help="评测模式",
     )
-    parser.add_argument(
-        "--output-dir", "-o",
-        type=str,
-        help="输出目录",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        help="LLM 模型名称 (覆盖配置)",
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        help="API Key (覆盖环境变量)",
-    )
-    parser.add_argument(
-        "--api-base",
-        type=str,
-        help="API Base URL",
-    )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        help="并发请求数",
-    )
-    parser.add_argument(
-        "--no-blind",
-        action="store_true",
-        help="禁用 Blind A/B",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="详细日志",
-    )
+    parser.add_argument("--output-dir", "-o", type=str, help="输出目录")
+    parser.add_argument("--model", type=str, help="LLM 模型名称")
+    parser.add_argument("--api-key", type=str, help="API Key")
+    parser.add_argument("--api-base", type=str, help="API Base URL")
+    parser.add_argument("--concurrency", type=int, help="并发请求数")
+    parser.add_argument("--rounds", type=int, help="一致性评审轮数 (默认 3)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="详细日志")
     return parser
 
 
 def parse_model_path(spec: str) -> tuple[str, str]:
-    """解析 version:path 格式。"""
-    if ":" in spec and not spec[1] == ":":  # 排除 Windows 盘符 C:
+    """解析 version:path 格式，兼容 Windows 盘符。"""
+    if ":" in spec and not spec[1] == ":":
         parts = spec.split(":", 1)
         return parts[0], parts[1]
     return "model", spec
@@ -108,7 +71,6 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # 日志
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -116,19 +78,17 @@ def main():
         handlers=[RichHandler(console=console, show_time=False, show_path=False)],
     )
 
-    # 加载配置
     if args.preset:
         preset_map = {
-            "pairwise": "configs/eval_presets/pairwise_ab.yaml",
-            "long_answer": "configs/eval_presets/long_answer.yaml",
-            "full_suite": "configs/eval_presets/full_suite.yaml",
+            "pairwise": "configs/eval_presets/pairwise.yaml",
+            "single": "configs/eval_presets/single.yaml",
+            "full": "configs/eval_presets/full.yaml",
         }
         config_path = preset_map[args.preset]
     else:
         config_path = args.config
 
     overrides: dict = {}
-
     if args.test_set:
         overrides["test_set_path"] = args.test_set
     if args.output_dir:
@@ -138,7 +98,6 @@ def main():
 
     config = load_config(config_path, overrides)
 
-    # CLI 参数覆盖配置
     if args.model:
         config.judge.primary_model = args.model
     if args.api_key:
@@ -147,10 +106,9 @@ def main():
         config.judge.primary_api_base = args.api_base
     if args.concurrency:
         config.judge.concurrency = args.concurrency
-    if args.no_blind:
-        config.judge.blind_ab = False
+    if args.rounds:
+        config.consistency.num_rounds = args.rounds
 
-    # 处理模型路径
     if args.baseline:
         ver, path = parse_model_path(args.baseline)
         config.baseline = ver
@@ -163,17 +121,16 @@ def main():
             if ver not in config.candidates:
                 config.candidates.append(ver)
 
-    # 运行
     engine = EvalEngine(config)
 
     try:
         results = asyncio.run(engine.run())
-        console.print(f"\n[bold green]✅ 评测完成，共 {len(results)} 个模式[/bold green]")
+        console.print(f"\n[bold green]评测完成，共 {len(results)} 个模式[/bold green]")
     except KeyboardInterrupt:
         console.print("\n[bold red]已中断[/bold red]")
         sys.exit(1)
     except Exception as e:
-        console.print(f"\n[bold red]❌ 错误: {e}[/bold red]")
+        console.print(f"\n[bold red]错误: {e}[/bold red]")
         if args.verbose:
             import traceback
             traceback.print_exc()

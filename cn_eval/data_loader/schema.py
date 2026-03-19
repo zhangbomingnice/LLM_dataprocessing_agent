@@ -1,22 +1,21 @@
 """
 评测系统核心数据模型。
 
-严格按蓝图定义：EvalMode / Prompt / ModelOutput / PairwiseResult / DimensionScores
+六维度统一评分体系：
+  format / structure / repetition / info_quality / naturalness / task_completion
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 
 class EvalMode(str, Enum):
-    IF_EVAL = "if_eval"
     PAIRWISE = "pairwise"
-    BENCHMARK = "benchmark"
-    LONG_ANSWER = "long_answer"
+    SINGLE = "single"
 
 
 # ── 输入数据模型 ──────────────────────────────────────────────
@@ -45,69 +44,59 @@ class ABMapping(BaseModel):
 
 # ── 评测结果模型 ──────────────────────────────────────────────
 
+DIMENSIONS = ["format", "structure", "repetition", "info_quality", "naturalness", "task_completion"]
+DIM_LABELS_ZH = ["格式排版", "内容结构", "重复冗余", "信息质量", "语言自然度", "任务完成度"]
+
+
 class DimensionScores(BaseModel):
-    mode: float = 0.0
+    format: float = 0.0
     structure: float = 0.0
-    organization: float = 0.0
-    fluency: float = 0.0
-    non_repetition: float = 0.0
-    task_fit: float = 0.0
-    factuality: Optional[float] = None
-    info_density: Optional[float] = None
-    executability: Optional[float] = None
+    repetition: float = 0.0
+    info_quality: float = 0.0
+    naturalness: float = 0.0
+    task_completion: float = 0.0
 
     def mean(self) -> float:
-        """核心六维度均值。"""
-        core = [self.mode, self.structure, self.organization,
-                self.fluency, self.non_repetition, self.task_fit]
-        return sum(core) / len(core)
+        """六维度均值。"""
+        vals = [self.format, self.structure, self.repetition,
+                self.info_quality, self.naturalness, self.task_completion]
+        return sum(vals) / len(vals)
 
     def to_dict(self) -> dict[str, float]:
-        d = {
-            "mode": self.mode, "structure": self.structure,
-            "organization": self.organization, "fluency": self.fluency,
-            "non_repetition": self.non_repetition, "task_fit": self.task_fit,
+        return {
+            "format": self.format,
+            "structure": self.structure,
+            "repetition": self.repetition,
+            "info_quality": self.info_quality,
+            "naturalness": self.naturalness,
+            "task_completion": self.task_completion,
         }
-        if self.factuality is not None:
-            d["factuality"] = self.factuality
-        if self.info_density is not None:
-            d["info_density"] = self.info_density
-        if self.executability is not None:
-            d["executability"] = self.executability
-        return d
+
+
+class EvalResult(BaseModel):
+    """统一评测结果（单条回答）。"""
+    prompt_id: str
+    model_version: str
+    scores: DimensionScores = Field(default_factory=DimensionScores)
+    pre_analysis: dict[str, Any] = Field(default_factory=dict)
+    judge_reasoning: str = ""
+    key_issues: list[str] = Field(default_factory=list)
+    consistency: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PairwiseResult(BaseModel):
     prompt_id: str
     model_a: str
     model_b: str
-    winner: str = ""  # "A" / "B" / "tie"
+    winner: str = ""
     judge_id: str = ""
     scores_a: DimensionScores = Field(default_factory=DimensionScores)
     scores_b: DimensionScores = Field(default_factory=DimensionScores)
     reasoning: str = ""
     position_swapped: bool = False
+    consistency: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-
-class IFResult(BaseModel):
-    """Instruction-Following 硬验证结果。"""
-    prompt_id: str
-    model_version: str
-    passed: bool
-    checks: dict[str, bool] = Field(default_factory=dict)
-    details: str = ""
-
-
-class LongAnswerResult(BaseModel):
-    """长回答专项评测结果。"""
-    prompt_id: str
-    model_version: str
-    scores: DimensionScores = Field(default_factory=DimensionScores)
-    repetition_stats: dict[str, Any] = Field(default_factory=dict)
-    structure_stats: dict[str, Any] = Field(default_factory=dict)
-    style_stats: dict[str, Any] = Field(default_factory=dict)
-    judge_reasoning: str = ""
 
 
 # ── 对齐后的数据结构 ──────────────────────────────────────────

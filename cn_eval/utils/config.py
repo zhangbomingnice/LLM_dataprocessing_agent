@@ -22,15 +22,19 @@ class JudgeConfig:
     primary_model: str = "MiniMax-Text-01"
     primary_api_key: str = field(default_factory=lambda: os.getenv("MINIMAX_API_KEY", ""))
     primary_api_base: str = "https://api.minimax.chat/v1"
-    secondary_models: list[str] = field(default_factory=list)
-    secondary_sample_ratio: float = 0.2
     temperature: float = 0.0
-    blind_ab: bool = True
-    swap_ratio: float = 0.5
     prompt_template: str = ""
-    aggregation: str = "majority_vote"
     concurrency: int = 5
     max_tokens: int = 4096
+
+
+@dataclass
+class ConsistencyConfig:
+    """多轮评审一致性配置。"""
+    num_rounds: int = 3
+    temperatures: list[float] = field(default_factory=lambda: [0.0, 0.05, 0.1])
+    variance_threshold: float = 1.5
+    aggregation: str = "median"
 
 
 @dataclass
@@ -56,7 +60,6 @@ class LongAnswerConfig:
         "总之", "综上所述", "希望以上内容对你有所帮助", "以上就是",
     ])
     half_split_ratio: float = 0.5
-    similarity_model: str = "shibing624/text2vec-base-chinese"
 
 
 @dataclass
@@ -65,43 +68,35 @@ class EvalConfig:
     project_name: str = "chinese-long-answer-eval"
     output_dir: str = "./outputs"
 
-    # 数据路径
     test_set_path: str = ""
     model_outputs: dict[str, str] = field(default_factory=dict)
     answer_key_path: str = ""
     human_annotations_path: str = ""
 
-    # 字段映射
     prompt_id_field: str = "prompt_id"
     response_field: str = "response"
     category_field: str = "category"
 
-    # 评测模式
-    eval_modes: list[str] = field(default_factory=lambda: ["pairwise", "long_answer"])
+    eval_modes: list[str] = field(default_factory=lambda: ["pairwise", "single"])
     baseline: str = "base"
     candidates: list[str] = field(default_factory=list)
     dimensions: list[str] = field(default_factory=lambda: [
-        "mode", "structure", "organization", "fluency", "non_repetition", "task_fit",
+        "format", "structure", "repetition", "info_quality", "naturalness", "task_completion",
     ])
 
-    # 子配置
     judge: JudgeConfig = field(default_factory=JudgeConfig)
+    consistency: ConsistencyConfig = field(default_factory=ConsistencyConfig)
     stats: StatsConfig = field(default_factory=StatsConfig)
     anomaly: AnomalyConfig = field(default_factory=AnomalyConfig)
     long_answer: LongAnswerConfig = field(default_factory=LongAnswerConfig)
 
-    # 报告
     report_formats: list[str] = field(default_factory=lambda: ["markdown", "csv"])
     report_charts: bool = True
     report_language: str = "zh"
 
 
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> EvalConfig:
-    """
-    从 YAML 文件加载配置，支持字段覆盖。
-
-    overrides 会递归覆盖 YAML 中的同名字段。
-    """
+    """从 YAML 文件加载配置。"""
     path = Path(path)
     if not path.exists():
         logger.warning("配置文件不存在: %s，使用默认配置", path)
@@ -115,7 +110,6 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Ev
     if overrides:
         config = _apply_overrides(config, overrides)
 
-    # 环境变量自动填充
     if not config.judge.primary_api_key:
         config.judge.primary_api_key = os.getenv("MINIMAX_API_KEY", "")
     if not config.judge.primary_api_key:
@@ -131,6 +125,7 @@ def _parse_config(raw: dict) -> EvalConfig:
     data = raw.get("data", {})
     eval_sec = raw.get("eval", {})
     judge_sec = raw.get("judge", {})
+    consistency_sec = raw.get("consistency", {})
     stats_sec = raw.get("stats", {})
     anomaly_sec = raw.get("anomaly", {})
     la_sec = raw.get("long_answer", {})
@@ -140,15 +135,18 @@ def _parse_config(raw: dict) -> EvalConfig:
         primary_model=judge_sec.get("primary", JudgeConfig.primary_model),
         primary_api_base=judge_sec.get("api_base", JudgeConfig.primary_api_base),
         primary_api_key=judge_sec.get("api_key", ""),
-        secondary_models=judge_sec.get("secondary", []),
-        secondary_sample_ratio=judge_sec.get("secondary_sample_ratio", 0.2),
         temperature=judge_sec.get("temperature", 0.0),
-        blind_ab=judge_sec.get("blind_ab", True),
-        swap_ratio=judge_sec.get("swap_ratio", 0.5),
         prompt_template=judge_sec.get("prompt_template", ""),
-        aggregation=judge_sec.get("aggregation", "majority_vote"),
         concurrency=judge_sec.get("concurrency", 5),
         max_tokens=judge_sec.get("max_tokens", 4096),
+    )
+
+    _consistency_defaults = ConsistencyConfig()
+    consistency_cfg = ConsistencyConfig(
+        num_rounds=consistency_sec.get("num_rounds", _consistency_defaults.num_rounds),
+        temperatures=consistency_sec.get("temperatures", _consistency_defaults.temperatures),
+        variance_threshold=consistency_sec.get("variance_threshold", _consistency_defaults.variance_threshold),
+        aggregation=consistency_sec.get("aggregation", _consistency_defaults.aggregation),
     )
 
     stats_cfg = StatsConfig(
@@ -170,7 +168,6 @@ def _parse_config(raw: dict) -> EvalConfig:
         ngram_sizes=la_sec.get("ngram_sizes", [3, 4, 5]),
         template_endings=la_sec.get("template_endings", _la_defaults.template_endings),
         half_split_ratio=la_sec.get("half_split_ratio", 0.5),
-        similarity_model=la_sec.get("similarity_model", _la_defaults.similarity_model),
     )
 
     return EvalConfig(
@@ -183,13 +180,14 @@ def _parse_config(raw: dict) -> EvalConfig:
         prompt_id_field=data.get("prompt_id_field", "prompt_id"),
         response_field=data.get("response_field", "response"),
         category_field=data.get("category_field", "category"),
-        eval_modes=eval_sec.get("modes", ["pairwise", "long_answer"]),
+        eval_modes=eval_sec.get("modes", ["pairwise", "single"]),
         baseline=eval_sec.get("baseline", "base"),
         candidates=eval_sec.get("candidates", []),
         dimensions=eval_sec.get("dimensions", [
-            "mode", "structure", "organization", "fluency", "non_repetition", "task_fit",
+            "format", "structure", "repetition", "info_quality", "naturalness", "task_completion",
         ]),
         judge=judge_cfg,
+        consistency=consistency_cfg,
         stats=stats_cfg,
         anomaly=anomaly_cfg,
         long_answer=la_cfg,

@@ -11,7 +11,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from cn_eval.data_loader.schema import DimensionScores
+from cn_eval.data_loader.schema import DimensionScores, DIMENSIONS
 from cn_eval.utils.llm_client import LLMClient
 from .base import BaseJudge
 
@@ -116,14 +116,6 @@ class LLMJudge(BaseJudge):
     def parse_scores(raw: dict) -> DimensionScores:
         """将 LLM 返回的 dict 解析为 DimensionScores。"""
         scores = raw.get("scores", raw.get("scores_a", raw))
-        return DimensionScores(
-            mode=float(scores.get("mode", 0)),
-            structure=float(scores.get("structure", 0)),
-            organization=float(scores.get("organization", 0)),
-            fluency=float(scores.get("fluency", 0)),
-            non_repetition=float(scores.get("non_repetition", 0)),
-            task_fit=float(scores.get("task_fit", 0)),
-            factuality=scores.get("factuality"),
-            info_density=scores.get("info_density"),
-            executability=scores.get("executability"),
-        )
+        return DimensionScores(**{
+            dim: float(scores.get(dim, 0)) for dim in DIMENSIONS
+        })

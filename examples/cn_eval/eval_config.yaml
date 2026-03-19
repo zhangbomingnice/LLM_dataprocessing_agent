@@ -9,19 +9,20 @@ data:
     v2: "examples/cn_eval/candidate_outputs.jsonl"
 
 eval:
-  modes: ["pairwise", "long_answer"]
+  modes: ["pairwise", "single"]
   baseline: "base"
   candidates: ["v2"]
 
 judge:
   primary: "MiniMax-Text-01"
   api_base: "https://api.minimax.chat/v1"
-  blind_ab: true
-  swap_ratio: 0.5
-  prompt_template: "configs/judge_prompts/pairwise_zh.txt"
-  aggregation: "majority_vote"
+  prompt_template: "configs/judge_prompts/unified_zh.txt"
   concurrency: 3
   temperature: 0.0
+
+consistency:
+  num_rounds: 3
+  temperatures: [0.0, 0.05, 0.1]
 
 report:
   formats: ["markdown", "csv"]

@@ -2,11 +2,12 @@
 异常检测模块 — 自动标记异常样本。
 
 异常类型：
+  - empty_response: 空回答
   - length_outlier: 长度异常（超出 percentile 范围）
   - high_repetition: n-gram 重复率过高
-  - judge_disagreement: 多 Judge 结论严重不一致
-  - empty_response: 空回答
-  - extreme_score: 极端分数
+  - judge_disagreement: 多轮评审结论不一致
+  - extreme_score: 极端分数（Z-score 异常）
+  - over_assistant_style: 助手化用语过多
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import logging
 from typing import Any
 
 from cn_eval.data_loader.schema import (
-    AnomalyFlag, ModelOutput, PairwiseResult, LongAnswerResult,
+    AnomalyFlag, ModelOutput, PairwiseResult, EvalResult,
 )
 from cn_eval.utils.config import AnomalyConfig
 from cn_eval.utils.text import count_chars, ngram_repetition_rate
@@ -68,45 +69,16 @@ class AnomalyDetector:
                 ))
 
         logger.info(
-            "[AnomalyDetector] 检出 %d / %d 条异常 (类型分布: %s)",
+            "[AnomalyDetector] 检出 %d / %d 条异常 (类型: %s)",
             len(flags), len(outputs), self._type_dist(flags),
         )
         return flags
 
-    def detect_from_pairwise(
+    def detect_from_eval_results(
         self,
-        results_by_judge: dict[str, list[PairwiseResult]],
+        results: list[EvalResult],
     ) -> list[AnomalyFlag]:
-        """从多 Judge 的 Pairwise 结果中检测 Judge 不一致。"""
-        flags: list[AnomalyFlag] = []
-
-        grouped: dict[str, dict[str, str]] = {}
-        for jid, results in results_by_judge.items():
-            for r in results:
-                grouped.setdefault(r.prompt_id, {})[jid] = r.winner
-
-        threshold = self.config.judge_disagreement_threshold
-        for pid, votes in grouped.items():
-            unique_winners = set(votes.values())
-            if len(unique_winners) >= threshold:
-                flags.append(AnomalyFlag(
-                    prompt_id=pid,
-                    anomaly_types=["judge_disagreement"],
-                    details={
-                        "votes": votes,
-                        "unique_conclusions": len(unique_winners),
-                    },
-                ))
-
-        if flags:
-            logger.info("[AnomalyDetector] Judge 不一致: %d 条", len(flags))
-        return flags
-
-    def detect_from_long_answer(
-        self,
-        results: list[LongAnswerResult],
-    ) -> list[AnomalyFlag]:
-        """从长回答评测结果中检测异常。"""
+        """从统一评测结果中检测异常。"""
         flags: list[AnomalyFlag] = []
         scores = [r.scores.mean() for r in results]
 
@@ -126,16 +98,21 @@ class AnomalyDetector:
                 details["score"] = round(score, 3)
                 details["z_score"] = round((score - mean_s) / std_s, 3)
 
-            rep_stats = result.repetition_stats
+            rep_stats = result.pre_analysis.get("repetition", {})
             ngram_rates = rep_stats.get("ngram_rates", {})
             worst = max(ngram_rates.values()) if ngram_rates else 0
             if worst > self.config.ngram_repeat_threshold:
                 anomalies.append("high_repetition")
                 details["worst_ngram_rate"] = round(worst, 4)
 
-            if result.style_stats.get("assistant_phrase_count", 0) > 3:
+            style = result.pre_analysis.get("style", {})
+            if style.get("assistant_phrase_count", 0) > 3:
                 anomalies.append("over_assistant_style")
-                details["assistant_phrases"] = result.style_stats.get("assistant_phrases", [])
+                details["assistant_phrases"] = style.get("assistant_phrases", [])
+
+            if result.consistency.get("uncertain", False):
+                anomalies.append("judge_disagreement")
+                details["max_std"] = result.consistency.get("max_std", 0)
 
             if anomalies:
                 flags.append(AnomalyFlag(
@@ -144,7 +121,7 @@ class AnomalyDetector:
                     details=details,
                 ))
 
-        logger.info("[AnomalyDetector] 长回答异常: %d / %d 条", len(flags), len(results))
+        logger.info("[AnomalyDetector] 评测结果异常: %d / %d 条", len(flags), len(results))
         return flags
 
     @staticmethod
