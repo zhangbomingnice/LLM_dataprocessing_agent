@@ -3,10 +3,11 @@
 
 核心流程：
   1. 规则预分析 → 生成客观数据报告（重复率、结构统计、AI 痕迹）
-  2. 预分析报告注入 LLM prompt → LLM 评审时参考客观数据
-  3. 多轮评审（K=3）→ 每轮微调温度 + 奇数轮交换 AB 位置
-  4. 中位数聚合 → 消除评分随机波动，标记高方差项
-  5. 规则后修正 → 用客观数据校准主观评分
+  2. 长文本智能截断（保头 60% + 尾 30%，预分析仍基于全文）
+  3. 预分析报告注入 LLM prompt → LLM 评审时参考客观数据
+  4. 多轮评审（K=3）→ 每轮微调温度 + 奇数轮交换 AB 位置
+  5. 中位数聚合 → 消除评分随机波动，标记高方差项
+  6. 规则后修正 → 用客观数据校准主观评分
 
 支持两种模式：
   - single: 逐条评测单个模型输出
@@ -20,7 +21,7 @@ import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from cn_eval.data_loader.schema import (
     DIMENSIONS,
@@ -44,7 +45,7 @@ class UnifiedEvaluator(BaseEvaluator):
     统一 LLM Judge 评测器。
 
     一个评测器覆盖 single + pairwise 两种模式，
-    内置多轮一致性保障 + 规则预分析 + 位置反转消偏。
+    内置多轮一致性保障 + 规则预分析 + 智能截断 + 位置反转消偏。
     """
 
     name = "unified"
@@ -53,6 +54,7 @@ class UnifiedEvaluator(BaseEvaluator):
         super().__init__(config)
         self.client = client
         self._system_prompt = self._load_system_prompt()
+        self._max_chars = config.judge.max_response_chars
 
     async def run(self, **kwargs: Any) -> dict[str, Any]:
         raise NotImplementedError("请使用 run_single() 或 run_pairwise()")
@@ -65,6 +67,7 @@ class UnifiedEvaluator(BaseEvaluator):
         self,
         prompts: list[Prompt],
         model_outputs: list[ModelOutput],
+        on_progress: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         prompt_map = {p.prompt_id: p for p in prompts}
         semaphore = asyncio.Semaphore(self.config.judge.concurrency)
@@ -72,9 +75,14 @@ class UnifiedEvaluator(BaseEvaluator):
         async def _eval(output: ModelOutput) -> EvalResult | None:
             prompt = prompt_map.get(output.prompt_id)
             if not prompt:
+                if on_progress:
+                    on_progress()
                 return None
             async with semaphore:
-                return await self._judge_single_item(prompt, output)
+                result = await self._judge_single_item(prompt, output)
+                if on_progress:
+                    on_progress()
+                return result
 
         tasks = [_eval(o) for o in model_outputs]
         raw = await asyncio.gather(*tasks)
@@ -91,10 +99,12 @@ class UnifiedEvaluator(BaseEvaluator):
         self, prompt: Prompt, output: ModelOutput,
     ) -> EvalResult | None:
         pre = self._pre_analyze(output.response)
-        pre_text = self._format_pre_analysis(pre)
+        response_for_llm = self._smart_truncate(output.response)
+        truncated = len(output.response) != len(response_for_llm)
+        pre_text = self._format_pre_analysis(pre, truncated=truncated)
         user_msg = (
             f"## 问题\n{prompt.text}\n\n"
-            f"## 模型回答\n{output.response}\n\n"
+            f"## 模型回答\n{response_for_llm}\n\n"
             f"{pre_text}"
         )
 
@@ -127,6 +137,7 @@ class UnifiedEvaluator(BaseEvaluator):
         prompts: list[Prompt],
         baseline_outputs: list[ModelOutput],
         candidate_outputs: list[ModelOutput],
+        on_progress: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         aligner = PromptAligner(prompts)
@@ -143,7 +154,10 @@ class UnifiedEvaluator(BaseEvaluator):
 
         async def _eval(pair: AlignedPair) -> PairwiseResult | None:
             async with semaphore:
-                return await self._judge_pairwise_item(pair)
+                result = await self._judge_pairwise_item(pair)
+                if on_progress:
+                    on_progress()
+                return result
 
         tasks = [_eval(p) for p in pairs]
         raw = await asyncio.gather(*tasks)
@@ -163,6 +177,11 @@ class UnifiedEvaluator(BaseEvaluator):
         pre_a = self._pre_analyze(pair.baseline_response)
         pre_b = self._pre_analyze(pair.candidate_response)
 
+        resp_a_llm = self._smart_truncate(pair.baseline_response)
+        resp_b_llm = self._smart_truncate(pair.candidate_response)
+        trunc_a = len(pair.baseline_response) != len(resp_a_llm)
+        trunc_b = len(pair.candidate_response) != len(resp_b_llm)
+
         temps = self.config.consistency.temperatures
         num_rounds = self.config.consistency.num_rounds
         rounds_data: list[dict] = []
@@ -172,19 +191,19 @@ class UnifiedEvaluator(BaseEvaluator):
             swap = (i % 2 == 1)
 
             if swap:
-                pa_text = self._format_pre_analysis(pre_b, label="A")
-                pb_text = self._format_pre_analysis(pre_a, label="B")
+                pa_text = self._format_pre_analysis(pre_b, label="A", truncated=trunc_b)
+                pb_text = self._format_pre_analysis(pre_a, label="B", truncated=trunc_a)
                 user_msg = self._build_pairwise_prompt(
                     pair.prompt_text,
-                    pair.candidate_response, pair.baseline_response,
+                    resp_b_llm, resp_a_llm,
                     pa_text, pb_text,
                 )
             else:
-                pa_text = self._format_pre_analysis(pre_a, label="A")
-                pb_text = self._format_pre_analysis(pre_b, label="B")
+                pa_text = self._format_pre_analysis(pre_a, label="A", truncated=trunc_a)
+                pb_text = self._format_pre_analysis(pre_b, label="B", truncated=trunc_b)
                 user_msg = self._build_pairwise_prompt(
                     pair.prompt_text,
-                    pair.baseline_response, pair.candidate_response,
+                    resp_a_llm, resp_b_llm,
                     pa_text, pb_text,
                 )
 
@@ -218,6 +237,32 @@ class UnifiedEvaluator(BaseEvaluator):
             scores_b=scores_b,
             reasoning=reasoning,
             consistency=consistency,
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # 智能截断
+    # ──────────────────────────────────────────────────────────
+
+    def _smart_truncate(self, text: str) -> str:
+        """
+        保头保尾、切中间。
+
+        头部 60%：看格式起手、结构开篇、主要论点
+        尾部 30%：看结尾质量、模板化检测、总结段
+        中间 10%：用于省略标记
+        预分析（n-gram/结构/风格）仍在全文上运行，不受截断影响。
+        """
+        if len(text) <= self._max_chars:
+            return text
+
+        head_size = int(self._max_chars * 0.6)
+        tail_size = int(self._max_chars * 0.3)
+        omitted = len(text) - head_size - tail_size
+
+        return (
+            text[:head_size]
+            + f"\n\n[...此处省略约 {omitted} 字，预分析报告包含全文统计数据...]\n\n"
+            + text[-tail_size:]
         )
 
     # ──────────────────────────────────────────────────────────
@@ -311,7 +356,9 @@ class UnifiedEvaluator(BaseEvaluator):
             "assistant_phrase_count": len(assistant_phrases),
         }
 
-    def _format_pre_analysis(self, pre: dict, label: str = "") -> str:
+    def _format_pre_analysis(
+        self, pre: dict, label: str = "", truncated: bool = False,
+    ) -> str:
         """将预分析结果格式化为人类可读文本，嵌入 LLM prompt。"""
         rep = pre.get("repetition", {})
         struct = pre.get("structure", {})
@@ -319,6 +366,12 @@ class UnifiedEvaluator(BaseEvaluator):
 
         tag = f"（回答 {label}）" if label else ""
         lines = [f"## 规则预分析报告{tag}"]
+
+        if truncated:
+            lines.append(
+                f"- [注意] 原文较长({rep.get('total_chars', 0)}字)，"
+                "已截断展示，以下统计数据基于全文"
+            )
 
         ngram_rates = rep.get("ngram_rates", {})
         if ngram_rates:
@@ -407,7 +460,6 @@ class UnifiedEvaluator(BaseEvaluator):
                 except (TypeError, ValueError):
                     all_b[dim].append(0.0)
 
-        # 多数投票决定胜者
         vote = Counter(winners)
         mc = vote.most_common()
         if len(mc) == 1:

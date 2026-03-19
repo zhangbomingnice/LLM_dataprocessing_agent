@@ -26,6 +26,7 @@ class JudgeConfig:
     prompt_template: str = ""
     concurrency: int = 5
     max_tokens: int = 4096
+    max_response_chars: int = 6000
 
 
 @dataclass
@@ -139,6 +140,7 @@ def _parse_config(raw: dict) -> EvalConfig:
         prompt_template=judge_sec.get("prompt_template", ""),
         concurrency=judge_sec.get("concurrency", 5),
         max_tokens=judge_sec.get("max_tokens", 4096),
+        max_response_chars=judge_sec.get("max_response_chars", 6000),
     )
 
     _consistency_defaults = ConsistencyConfig()

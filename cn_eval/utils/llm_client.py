@@ -1,5 +1,7 @@
 """
 LLM API 调用封装 — 默认对接 MiniMax，兼容 OpenAI 格式 API。
+
+内置 Token 实时追踪。
 """
 
 from __future__ import annotations
@@ -7,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -16,6 +19,44 @@ logger = logging.getLogger(__name__)
 
 MINIMAX_DEFAULT_BASE_URL = "https://api.minimax.chat/v1"
 MINIMAX_DEFAULT_MODEL = "MiniMax-Text-01"
+
+
+class TokenTracker:
+    """线程安全的 Token 用量累计器。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.call_count = 0
+
+    def record(self, usage: Any) -> None:
+        if usage is None:
+            return
+        with self._lock:
+            self.call_count += 1
+            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            self.total_tokens += getattr(usage, "total_tokens", 0) or 0
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "call_count": self.call_count,
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+            }
+
+    def __repr__(self) -> str:
+        s = self.snapshot()
+        return (
+            f"TokenTracker(calls={s['call_count']}, "
+            f"prompt={s['prompt_tokens']:,}, "
+            f"completion={s['completion_tokens']:,}, "
+            f"total={s['total_tokens']:,})"
+        )
 
 
 class LLMClient:
@@ -32,6 +73,7 @@ class LLMClient:
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.tracker = TokenTracker()
         self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     @retry(
@@ -58,8 +100,12 @@ class LLMClient:
             kwargs["response_format"] = response_format
 
         resp = await self._client.chat.completions.create(**kwargs)
+
+        # Token 追踪
+        self.tracker.record(resp.usage)
+
         content = resp.choices[0].message.content or ""
-        logger.debug("[LLMClient] 响应长度: %d 字符", len(content))
+        logger.debug("[LLMClient] 响应 %d 字符", len(content))
         return content
 
     async def chat_json(

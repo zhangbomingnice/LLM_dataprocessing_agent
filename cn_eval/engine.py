@@ -5,9 +5,10 @@ EvalEngine — 评测主引擎，串联完整流程。
   1. 加载配置 + 初始化 LLM Client
   2. 加载数据（prompts + model outputs）
   3. 数据校验
-  4. 统一 LLM Judge 评测（single / pairwise）
+  4. 统一 LLM Judge 评测（single / pairwise），带进度条
   5. 分析（统计 + 异常检测 + 版本对比）
   6. 生成报告（Markdown + CSV + 图表）
+  7. 展示 Token 用量统计
 """
 
 from __future__ import annotations
@@ -19,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.progress import (
+    Progress, SpinnerColumn, TextColumn,
+    BarColumn, TaskProgressColumn,
+    TimeElapsedColumn, TimeRemainingColumn,
+)
 from rich.table import Table
 
 from cn_eval.data_loader.loader import UnifiedLoader
@@ -100,6 +106,14 @@ class EvalEngine:
                 continue
 
             self.results[mode.value] = result
+
+            # 中间 Token 快照
+            snap = self.client.tracker.snapshot()
+            console.print(
+                f"  [dim]Token 累计: {snap['total_tokens']:,} "
+                f"({snap['call_count']} 次调用)[/dim]"
+            )
+
             self._display_summary(mode.value, result.get("summary", {}))
 
         console.rule("[bold magenta]分析引擎")
@@ -110,8 +124,15 @@ class EvalEngine:
 
         self._save_results()
 
+        # 最终 Token 用量汇总
+        self._display_token_usage()
+
         console.rule("[bold green]评测完成")
         return self.results
+
+    # ──────────────────────────────────────────────────────────
+    # 数据加载
+    # ──────────────────────────────────────────────────────────
 
     def _load_data(self) -> None:
         if self.config.test_set_path:
@@ -149,6 +170,10 @@ class EvalEngine:
             for w in warnings:
                 console.print(f"  [yellow][{version}] {w}[/yellow]")
 
+    # ──────────────────────────────────────────────────────────
+    # 评测（带进度条）
+    # ──────────────────────────────────────────────────────────
+
     async def _run_pairwise(self, evaluator: UnifiedEvaluator) -> dict[str, Any]:
         baseline = self.config.baseline
         candidates = self.config.candidates or [
@@ -159,17 +184,42 @@ class EvalEngine:
             console.print(f"  [red]baseline [{baseline}] 无数据[/red]")
             return {"results": [], "summary": {}}
 
+        rounds_per_item = self.config.consistency.num_rounds
+
         all_results = {}
         for cand in candidates:
             if cand not in self.outputs_by_version:
                 continue
-            console.print(f"  对比: [{baseline}] vs [{cand}]")
-            result = await evaluator.run_pairwise(
-                prompts=self.prompts,
-                baseline_outputs=self.outputs_by_version[baseline],
-                candidate_outputs=self.outputs_by_version[cand],
-                candidate_version=cand,
+
+            n_items = min(
+                len(self.outputs_by_version[baseline]),
+                len(self.outputs_by_version[cand]),
             )
+            desc = f"Pairwise [{baseline}] vs [{cand}]"
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("({task.completed}/{task.total})"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            ) as progress:
+                task = progress.add_task(desc, total=n_items)
+
+                def advance():
+                    progress.advance(task)
+
+                result = await evaluator.run_pairwise(
+                    prompts=self.prompts,
+                    baseline_outputs=self.outputs_by_version[baseline],
+                    candidate_outputs=self.outputs_by_version[cand],
+                    candidate_version=cand,
+                    on_progress=advance,
+                )
             all_results[f"{baseline}_vs_{cand}"] = result
 
         if len(all_results) == 1:
@@ -179,13 +229,62 @@ class EvalEngine:
     async def _run_single(self, evaluator: UnifiedEvaluator) -> dict[str, Any]:
         all_results = {}
         for version, outputs in self.outputs_by_version.items():
-            console.print(f"  评测模型 [{version}]")
-            result = await evaluator.run_single(
-                prompts=self.prompts,
-                model_outputs=outputs,
-            )
+            desc = f"Single [{version}]"
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("({task.completed}/{task.total})"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+                console=console,
+                transient=False,
+            ) as progress:
+                task = progress.add_task(desc, total=len(outputs))
+
+                def advance():
+                    progress.advance(task)
+
+                result = await evaluator.run_single(
+                    prompts=self.prompts,
+                    model_outputs=outputs,
+                    on_progress=advance,
+                )
             all_results[version] = result
         return all_results
+
+    # ──────────────────────────────────────────────────────────
+    # Token 用量展示
+    # ──────────────────────────────────────────────────────────
+
+    def _display_token_usage(self) -> None:
+        if not self.client:
+            return
+        snap = self.client.tracker.snapshot()
+        if snap["call_count"] == 0:
+            return
+
+        table = Table(title="Token 用量统计", show_lines=True)
+        table.add_column("指标", style="cyan")
+        table.add_column("数值", style="green", justify="right")
+
+        table.add_row("API 调用次数", f"{snap['call_count']:,}")
+        table.add_row("Prompt Tokens", f"{snap['prompt_tokens']:,}")
+        table.add_row("Completion Tokens", f"{snap['completion_tokens']:,}")
+        table.add_row("Total Tokens", f"{snap['total_tokens']:,}")
+
+        avg = snap["total_tokens"] / snap["call_count"] if snap["call_count"] else 0
+        table.add_row("平均每次调用", f"{avg:,.0f}")
+
+        console.print(table)
+
+        self.results["_token_usage"] = snap
+
+    # ──────────────────────────────────────────────────────────
+    # 分析 + 报告
+    # ──────────────────────────────────────────────────────────
 
     def _run_analysis(self) -> dict[str, Any]:
         analysis: dict[str, Any] = {}
@@ -199,7 +298,6 @@ class EvalEngine:
                 console.print(f"  [{version}] 检出 {len(flags)} 条异常")
         analysis["anomalies"] = all_anomalies
 
-        # 单模型评测深度分析
         single_data = self.results.get("single", {})
         if single_data and isinstance(single_data, dict):
             la_analyzer = LongAnswerAnalyzer()
@@ -215,7 +313,6 @@ class EvalEngine:
                         all_anomalies.extend(la_flags)
             analysis["single_analysis"] = la_analysis
 
-        # 版本对比
         comparer = VersionComparer()
         if single_data and len(single_data) >= 2:
             analysis["version_comparison"] = comparer.compare_single(single_data)
@@ -241,6 +338,7 @@ class EvalEngine:
     def _generate_reports(self, analysis: dict[str, Any]) -> None:
         out_dir = Path(self.config.output_dir)
 
+        token_snap = self.client.tracker.snapshot() if self.client else {}
         config_summary = {
             "项目": self.config.project_name,
             "评测模式": ", ".join(self.config.eval_modes),
@@ -248,6 +346,8 @@ class EvalEngine:
             "一致性轮数": self.config.consistency.num_rounds,
             "模型版本": ", ".join(self.outputs_by_version.keys()),
             "测试题数": len(self.prompts),
+            "最大回答字数": self.config.judge.max_response_chars,
+            "Token 总用量": f"{token_snap.get('total_tokens', 0):,}",
         }
 
         if "markdown" in self.config.report_formats:
