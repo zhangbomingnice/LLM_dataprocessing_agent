@@ -1,0 +1,28 @@
+project:
+  name: "demo-eval"
+  output_dir: "./outputs/demo"
+
+data:
+  test_set: "examples/cn_eval/test_set.jsonl"
+  model_outputs:
+    base: "examples/cn_eval/base_outputs.jsonl"
+    v2: "examples/cn_eval/candidate_outputs.jsonl"
+
+eval:
+  modes: ["pairwise", "long_answer"]
+  baseline: "base"
+  candidates: ["v2"]
+
+judge:
+  primary: "MiniMax-Text-01"
+  api_base: "https://api.minimax.chat/v1"
+  blind_ab: true
+  swap_ratio: 0.5
+  prompt_template: "configs/judge_prompts/pairwise_zh.txt"
+  aggregation: "majority_vote"
+  concurrency: 3
+  temperature: 0.0
+
+report:
+  formats: ["markdown", "csv"]
+  charts: true

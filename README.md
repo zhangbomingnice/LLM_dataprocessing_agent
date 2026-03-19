@@ -239,18 +239,88 @@ python main.py {generate,evaluate,cot} "你的需求" [OPTIONS]
 - ❌ 不适合：让它帮你训练模型（它只洗数据，不炼丹）
 - ❌ 不适合：当搜索引擎用（它又不是 Google）
 
+---
+
+## 🏆 cn_eval — 中文长回答 SFT 评测系统
+
+> 洗完数据还不够？来，评测一下你训练出来的模型到底行不行。
+
+`cn_eval` 是本项目的第二大模块，专门针对 **中文长回答 SFT 模型** 设计的全自动评测系统。对接 MiniMax API 作为 Judge，支持多种评测模式和深度分析。
+
+### 四种评测模式
+
+| 模式 | 说明 |
+|------|------|
+| **Pairwise** | 两个模型版本配对对比，Blind A/B 消除位置偏见 |
+| **Long-Answer** | 长回答专项：六维度打分 + n-gram 重复率 + 模板化检测 |
+| **IF-Eval** | 指令遵循硬验证：正则提取约束 + LLM 辅助判断 |
+| **Benchmark** | 基准评测：Exact-Match / F1 / ROUGE-L |
+
+### 核心特性
+
+- **多 Judge 机制**: LLM Judge + Rule Judge + Blind A/B 位置交换 + 多 Judge 聚合
+- **稳健统计**: Bootstrap 置信区间、Wilcoxon 符号秩检验、Cohen's d 效应量
+- **异常检测**: 长度离群、重复率异常、Judge 不一致、极端分数自动标记
+- **长回答深度分析**: 逐句重复模式、前后半段一致性、模板化/助手化诊断
+- **版本对比**: 跨版本维度级统计检验 + 效应量分析
+- **自动报告**: Markdown 报告 + CSV 数据表 + 雷达图/柱状图/饼图
+
+### 快速开始
+
+```bash
+# 使用示例数据评测
+python -m cn_eval.cli --config examples/cn_eval/eval_config.yaml
+
+# 使用预设配置
+python -m cn_eval.cli --preset pairwise \
+  --test-set data/prompts.jsonl \
+  --baseline base:data/base.jsonl \
+  --candidate v2:data/v2.jsonl
+
+# 仅做长回答评测
+python -m cn_eval.cli --preset long_answer \
+  --test-set data/prompts.jsonl \
+  --baseline base:data/base.jsonl
+
+# 指定模型和并发数
+python -m cn_eval.cli --config my_config.yaml \
+  --model MiniMax-Text-01 --concurrency 10
+```
+
+### 输出结构
+
+```
+outputs/
+├── eval_results.json      # 完整评测结果
+├── report.md              # Markdown 评测报告
+├── csv/
+│   ├── pairwise.csv       # Pairwise 逐条结果
+│   ├── long_answer_*.csv  # 长回答逐条结果
+│   ├── anomalies.csv      # 异常样本
+│   └── version_compare.csv
+└── charts/
+    ├── radar.png           # 维度雷达图
+    ├── bar_compare.png     # 维度柱状图
+    └── winrate_pie.png     # 胜率饼图
+```
+
+---
+
 ## 技术栈
 
 - **Python 3.10+** + asyncio 异步并发
-- **OpenAI SDK** — 兼容一切 OpenAI 格式 API
+- **OpenAI SDK** — 兼容 OpenAI / MiniMax / DeepSeek 等 API
 - **Pydantic v2** — 数据校验
 - **Rich** — 终端进度条、彩色表格
 - **SymPy** — 符号数学验算
 - **python-docx** — Word 读写
+- **PyYAML** — 配置管理
+- **matplotlib** — 评测图表
+- **jieba** — 中文分词
 
 ## License
 
-MIT — 随便用，拿去洗数据吧。
+MIT — 随便用，拿去洗数据 + 评测模型吧。
 
 ---
 

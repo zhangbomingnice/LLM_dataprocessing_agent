@@ -6,8 +6,8 @@ EvalEngine — 评测主引擎，串联完整流程。
   2. 加载数据（prompts + model outputs）
   3. 数据校验
   4. 按模式分发 → Evaluator
-  5. 收集结果
-  6. (后续第三/四期) 分析 → 报告
+  5. 分析（统计 + 异常检测 + 版本对比）
+  6. 生成报告（Markdown + CSV + 图表）
 """
 
 from __future__ import annotations
@@ -23,12 +23,21 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.table import Table
 
 from cn_eval.data_loader.loader import UnifiedLoader
-from cn_eval.data_loader.schema import Prompt, ModelOutput, EvalMode
+from cn_eval.data_loader.schema import (
+    Prompt, ModelOutput, EvalMode, PairwiseResult, LongAnswerResult,
+)
 from cn_eval.data_loader.validators import DataValidator
 from cn_eval.evaluators.pairwise_eval import PairwiseEvaluator
 from cn_eval.evaluators.long_answer_eval import LongAnswerEvaluator
 from cn_eval.evaluators.if_eval import IFEvaluator
 from cn_eval.evaluators.benchmark_eval import BenchmarkEvaluator
+from cn_eval.analyzers.basic_stats import StatsCalculator
+from cn_eval.analyzers.anomaly_detector import AnomalyDetector
+from cn_eval.analyzers.long_answer_analyzer import LongAnswerAnalyzer
+from cn_eval.analyzers.version_compare import VersionComparer
+from cn_eval.report.markdown_report import MarkdownReporter
+from cn_eval.report.csv_report import CSVReporter
+from cn_eval.report.chart_gen import ChartGenerator
 from cn_eval.utils.config import EvalConfig, load_config
 from cn_eval.utils.llm_client import LLMClient
 
@@ -104,7 +113,15 @@ class EvalEngine:
             self.results[mode.value] = result
             self._display_summary(mode.value, result.get("summary", {}))
 
-        # 5. 保存结果
+        # 5. 分析
+        console.rule("[bold magenta]分析引擎")
+        analysis = self._run_analysis()
+
+        # 6. 生成报告
+        console.rule("[bold blue]生成报告")
+        self._generate_reports(analysis)
+
+        # 7. 保存原始结果
         self._save_results()
 
         console.rule("[bold green]评测完成")
@@ -240,6 +257,146 @@ class EvalEngine:
             all_results[version] = result
 
         return all_results
+
+    def _run_analysis(self) -> dict[str, Any]:
+        """运行分析引擎。"""
+        analysis: dict[str, Any] = {}
+
+        # 异常检测
+        anomaly_detector = AnomalyDetector(self.config.anomaly)
+        all_anomalies = []
+        for version, outputs in self.outputs_by_version.items():
+            flags = anomaly_detector.detect_from_outputs(outputs)
+            if flags:
+                all_anomalies.extend(flags)
+                console.print(f"  🔍 [{version}] 检出 {len(flags)} 条异常")
+        analysis["anomalies"] = all_anomalies
+
+        # 长回答深度分析
+        la_analyzer = LongAnswerAnalyzer()
+        la_data = self.results.get("long_answer", {})
+        if la_data and isinstance(la_data, dict):
+            la_analysis = {}
+            for version, vdata in la_data.items():
+                if isinstance(vdata, dict) and "results" in vdata:
+                    results = vdata["results"]
+                    if results and isinstance(results[0], LongAnswerResult):
+                        la_analysis[version] = la_analyzer.analyze_batch(results)
+                        console.print(f"  📊 [{version}] 长回答深度分析完成")
+
+                        la_flags = anomaly_detector.detect_from_long_answer(results)
+                        all_anomalies.extend(la_flags)
+            analysis["long_answer_analysis"] = la_analysis
+
+        # 版本对比
+        comparer = VersionComparer()
+        if la_data and len(la_data) >= 2:
+            analysis["version_comparison"] = comparer.compare_long_answer(la_data)
+            console.print("  🔀 版本对比分析完成")
+
+        pw_data = self.results.get("pairwise", {})
+        if pw_data:
+            if "results" in pw_data:
+                analysis["pairwise_comparison"] = comparer.compare_pairwise(
+                    {"default": pw_data}
+                )
+            elif any(isinstance(v, dict) and "results" in v for v in pw_data.values()):
+                analysis["pairwise_comparison"] = comparer.compare_pairwise(pw_data)
+
+        # 统计摘要
+        stats = StatsCalculator()
+        for version, outputs in self.outputs_by_version.items():
+            lengths = [len(o.response) for o in outputs]
+            analysis.setdefault("length_stats", {})[version] = stats.basic(lengths)
+
+        self.results["_analysis"] = analysis
+        return analysis
+
+    def _generate_reports(self, analysis: dict[str, Any]) -> None:
+        """生成所有格式的报告。"""
+        out_dir = Path(self.config.output_dir)
+
+        # 配置摘要
+        config_summary = {
+            "项目": self.config.project_name,
+            "评测模式": ", ".join(self.config.eval_modes),
+            "Judge 模型": self.config.judge.primary_model,
+            "Blind A/B": self.config.judge.blind_ab,
+            "聚合策略": self.config.judge.aggregation,
+            "模型版本": ", ".join(self.outputs_by_version.keys()),
+            "测试题数": len(self.prompts),
+        }
+
+        # Markdown 报告
+        if "markdown" in self.config.report_formats:
+            reporter = MarkdownReporter()
+            display_results = {k: v for k, v in self.results.items() if not k.startswith("_")}
+            reporter.generate(
+                display_results, config_summary,
+                output_path=out_dir / "report.md",
+            )
+            console.print("  📄 Markdown 报告已生成")
+
+        # CSV 报告
+        if "csv" in self.config.report_formats:
+            csv_reporter = CSVReporter()
+            csv_dir = out_dir / "csv"
+
+            pw_data = self.results.get("pairwise", {})
+            if pw_data:
+                results = pw_data.get("results", [])
+                if results and isinstance(results[0], PairwiseResult):
+                    csv_reporter.export_pairwise(results, csv_dir / "pairwise.csv")
+
+            la_data = self.results.get("long_answer", {})
+            for version, vdata in (la_data.items() if isinstance(la_data, dict) else []):
+                if isinstance(vdata, dict) and "results" in vdata:
+                    results = vdata["results"]
+                    if results and isinstance(results[0], LongAnswerResult):
+                        csv_reporter.export_long_answer(
+                            results, csv_dir / f"long_answer_{version}.csv",
+                        )
+
+            anomalies = analysis.get("anomalies", [])
+            if anomalies:
+                csv_reporter.export_anomalies(anomalies, csv_dir / "anomalies.csv")
+
+            # 版本对比表
+            comparer = VersionComparer()
+            if la_data and isinstance(la_data, dict):
+                table_rows = comparer.summary_table(la_data)
+                if table_rows:
+                    csv_reporter.export_version_table(table_rows, csv_dir / "version_compare.csv")
+
+            console.print("  📊 CSV 报告已生成")
+
+        # 图表
+        if self.config.report_charts:
+            chart_gen = ChartGenerator(out_dir / "charts")
+
+            # 维度雷达图
+            la_data = self.results.get("long_answer", {})
+            version_scores = {}
+            for version, vdata in (la_data.items() if isinstance(la_data, dict) else []):
+                if isinstance(vdata, dict):
+                    dim_avgs = vdata.get("summary", {}).get("dimension_averages", {})
+                    if dim_avgs:
+                        version_scores[version] = dim_avgs
+
+            if version_scores:
+                chart_gen.radar_chart(version_scores)
+                chart_gen.bar_chart(version_scores)
+                console.print("  📈 图表已生成")
+
+            # 胜率饼图
+            pw_data = self.results.get("pairwise", {})
+            pw_summary = pw_data.get("summary", {})
+            if pw_summary:
+                chart_gen.win_rate_pie(
+                    pw_summary.get("win_rate_a", 0),
+                    pw_summary.get("win_rate_b", 0),
+                    pw_summary.get("tie_rate", 0),
+                )
 
     def _display_summary(self, mode: str, summary: dict) -> None:
         """用 Rich 表格展示摘要。"""
