@@ -1,0 +1,20 @@
+project:
+  name: "long-answer-eval"
+  output_dir: "./outputs/long_answer"
+
+eval:
+  modes: ["long_answer"]
+
+judge:
+  primary: "MiniMax-Text-01"
+  prompt_template: "configs/judge_prompts/long_answer_zh.txt"
+
+long_answer:
+  ngram_sizes: [3, 4, 5]
+  template_endings:
+    - "总之"
+    - "综上所述"
+    - "希望以上内容对你有所帮助"
+    - "以上就是"
+    - "希望对您有帮助"
+  half_split_ratio: 0.5

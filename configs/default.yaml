@@ -1,0 +1,65 @@
+project:
+  name: "chinese-long-answer-eval"
+  output_dir: "./outputs"
+
+data:
+  test_set: "path/to/test_set.jsonl"
+  model_outputs:
+    base: "path/to/base_outputs.jsonl"
+  answer_key: ""
+  human_annotations: null
+  prompt_id_field: "prompt_id"
+  response_field: "response"
+  category_field: "category"
+
+eval:
+  modes: ["pairwise", "long_answer"]
+  baseline: "base"
+  candidates: []
+  dimensions:
+    - mode
+    - structure
+    - organization
+    - fluency
+    - non_repetition
+    - task_fit
+
+judge:
+  primary: "MiniMax-Text-01"
+  api_base: "https://api.minimax.chat/v1"
+  secondary: []
+  secondary_sample_ratio: 0.2
+  temperature: 0.0
+  blind_ab: true
+  swap_ratio: 0.5
+  prompt_template: "configs/judge_prompts/pairwise_zh.txt"
+  aggregation: "majority_vote"
+  concurrency: 5
+  max_tokens: 4096
+
+stats:
+  trimmed_ratio: 0.1
+  bootstrap_n: 1000
+  confidence_level: 0.95
+  hypothesis_tests: ["wilcoxon", "sign_test"]
+
+anomaly:
+  common_anomaly_threshold: 2.0
+  length_percentile: [5, 95]
+  ngram_repeat_threshold: 0.3
+  judge_disagreement_threshold: 2
+
+long_answer:
+  ngram_sizes: [3, 4, 5]
+  template_endings:
+    - "总之"
+    - "综上所述"
+    - "希望以上内容对你有所帮助"
+    - "以上就是"
+  half_split_ratio: 0.5
+  similarity_model: "shibing624/text2vec-base-chinese"
+
+report:
+  formats: ["markdown", "csv"]
+  charts: true
+  language: "zh"

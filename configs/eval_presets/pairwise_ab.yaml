@@ -1,0 +1,13 @@
+project:
+  name: "pairwise-ab-eval"
+  output_dir: "./outputs/pairwise"
+
+eval:
+  modes: ["pairwise"]
+
+judge:
+  primary: "MiniMax-Text-01"
+  blind_ab: true
+  swap_ratio: 0.5
+  prompt_template: "configs/judge_prompts/pairwise_zh.txt"
+  aggregation: "majority_vote"
