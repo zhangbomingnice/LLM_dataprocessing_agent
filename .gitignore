@@ -22,5 +22,7 @@ output.jsonl
 report.json
 *.log
 
+outputs/
+
 .DS_Store
 Thumbs.db
